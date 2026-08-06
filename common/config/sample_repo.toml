@@ -1,0 +1,19 @@
+[repo]
+name = "Sample Repo"
+baseurl = "https://example.org/"
+enabled = true
+priority = 99
+
+# TLS certificate verification. Leave this false. It exists for debugging
+# against a local mirror with a self-signed certificate, and it disables the
+# only transport-level protection there is.
+skip-tls = false
+
+# Signature verification is ON by default: the repository must publish a
+# repo.db.sig that verifies against a public key in /etc/tape/keys, and the
+# signed index carries a sha256 for every package.
+#
+# Set this to true only for a repository you produce and trust by other means
+# (a local build tree, say). It turns off verification for both the index and
+# every package the repository serves.
+# allow-unsigned = true

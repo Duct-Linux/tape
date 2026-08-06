@@ -1,0 +1,7 @@
+[daemon]
+socket = "/var/run/tape.sock"
+pid = "/var/run/tape.pid"
+log = "/var/log/tape.log"
+
+[cli]
+daemon-start = true

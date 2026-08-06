@@ -1,0 +1,3 @@
+- implement test library and test cases
+- documentation inside the code
+- Makefile: add install
