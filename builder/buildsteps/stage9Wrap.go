@@ -48,6 +48,11 @@ func Stage9Wrap() error {
 	wrapConfig.Set("package.arch", pkgArch)
 
 	deps := buildConfig.GetStringMap("dependencies")
+
+	// What the payload actually links against, against what the recipe claims.
+	// A package can otherwise install cleanly and fail to run.
+	checkDeclaredDeps(utils.DirWrapInstall(pkgPath), deps, log)
+
 	// filter out build dependencies
 	deps["build"] = nil
 	wrapConfig.Set("dependencies", deps)

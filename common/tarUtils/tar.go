@@ -76,13 +76,25 @@ func Tar(src string, writers ...io.Writer) error {
 	// even if the environment changes underneath a long build.
 	modTime := archiveModTime()
 
+	// Tracks the first archive name seen for each inode, so the second and
+	// later links to it are stored as links rather than as further copies of
+	// the same bytes.
+	seen := make(map[inodeKey]string)
+
 	for _, path := range paths {
-		if err := writeTarEntry(tw, src, path, modTime); err != nil {
+		if err := writeTarEntry(tw, src, path, modTime, seen); err != nil {
 			return err
 		}
 	}
 
 	return nil
+}
+
+// inodeKey identifies a file on disk, so two paths sharing one inode can be
+// recognised as the same file.
+type inodeKey struct {
+	dev uint64
+	ino uint64
 }
 
 // collectPaths gathers every path under src, sorted, excluding src itself.
@@ -110,7 +122,7 @@ func collectPaths(src string) ([]string, error) {
 	return paths, nil
 }
 
-func writeTarEntry(tw *tar.Writer, src, path string, modTime time.Time) error {
+func writeTarEntry(tw *tar.Writer, src, path string, modTime time.Time, seen map[inodeKey]string) error {
 	// Lstat, not Stat: a symlink must be recorded as a link rather than
 	// followed and stored as a copy of whatever it points at.
 	fi, err := os.Lstat(path)
@@ -148,6 +160,26 @@ func writeTarEntry(tw *tar.Writer, src, path string, modTime time.Time) error {
 	header.Uname, header.Gname = "", ""
 	header.AccessTime, header.ChangeTime = zeroTime, zeroTime
 	header.ModTime = modTime
+
+	// A hard link is one file under several names. The walk sees each name
+	// separately, and storing every one as a regular file writes the contents
+	// once per name: uutils installs 107 links to a single 14 MB binary, which
+	// came out as a 643 MB package for 14 MB of program.
+	//
+	// The first name encountered carries the payload; the rest become
+	// TypeLink entries pointing at it. Sorting in collectPaths makes which
+	// name comes first deterministic, so the archive stays reproducible.
+	if fi.Mode().IsRegular() {
+		if key, ok := inodeOf(fi); ok {
+			if target, dup := seen[key]; dup {
+				header.Typeflag = tar.TypeLink
+				header.Linkname = target
+				header.Size = 0
+				return tw.WriteHeader(header)
+			}
+			seen[key] = name
+		}
+	}
 
 	switch {
 	case fi.IsDir():

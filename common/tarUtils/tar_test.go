@@ -294,3 +294,121 @@ func TestTarUntarRoundTrip(t *testing.T) {
 		t.Error("var/log/demo came back as something other than a directory")
 	}
 }
+
+// A hard link is one file under several names. Storing each name as its own
+// regular file writes the contents once per name: uutils installs 107 links to
+// a single 14 MB binary, and the package came out at 643 MB for 14 MB of
+// program.
+func TestTarStoresHardLinksAsLinks(t *testing.T) {
+	src := t.TempDir()
+
+	body := bytes.Repeat([]byte("x"), 64*1024)
+	first := filepath.Join(src, "aaa-original")
+	if err := os.WriteFile(first, body, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	for _, n := range []string{"bbb-link", "ccc-link"} {
+		if err := os.Link(first, filepath.Join(src, n)); err != nil {
+			t.Skipf("hard links unsupported here: %v", err)
+		}
+	}
+
+	var buf bytes.Buffer
+	if err := Tar(src, &buf); err != nil {
+		t.Fatalf("Tar: %v", err)
+	}
+
+	// The payload must appear once, not three times.
+	if buf.Len() > 32*1024 {
+		t.Errorf("archive is %d bytes; the 64 KiB body was stored more than once", buf.Len())
+	}
+
+	zr, err := gzip.NewReader(bytes.NewReader(buf.Bytes()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	tr := tar.NewReader(zr)
+	links, regulars := map[string]string{}, 0
+	for {
+		h, err := tr.Next()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			t.Fatal(err)
+		}
+		switch h.Typeflag {
+		case tar.TypeLink:
+			links[h.Name] = h.Linkname
+		case tar.TypeReg:
+			regulars++
+		}
+	}
+	if regulars != 1 {
+		t.Errorf("stored %d regular files, want 1", regulars)
+	}
+	// Sorted order decides which name carries the payload, so the archive is
+	// reproducible rather than dependent on directory iteration order.
+	for _, n := range []string{"bbb-link", "ccc-link"} {
+		if links[n] != "aaa-original" {
+			t.Errorf("%s links to %q, want aaa-original", n, links[n])
+		}
+	}
+}
+
+// Extracting must put the links back, not silently produce copies.
+func TestUntarRestoresHardLinks(t *testing.T) {
+	src := t.TempDir()
+	first := filepath.Join(src, "aaa")
+	if err := os.WriteFile(first, []byte("shared"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Link(first, filepath.Join(src, "bbb")); err != nil {
+		t.Skipf("hard links unsupported here: %v", err)
+	}
+
+	var buf bytes.Buffer
+	if err := Tar(src, &buf); err != nil {
+		t.Fatal(err)
+	}
+
+	dst := t.TempDir()
+	opts := DefaultUntarOptions
+	opts.AllowLinks = true
+	if err := UntarWithOptions(dst, bytes.NewReader(buf.Bytes()), opts); err != nil {
+		t.Fatalf("Untar: %v", err)
+	}
+
+	a, err := os.Stat(filepath.Join(dst, "aaa"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	b, err := os.Stat(filepath.Join(dst, "bbb"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !os.SameFile(a, b) {
+		t.Error("extracted names are separate files; the hard link was not restored")
+	}
+}
+
+// A hardlink entry pointing outside the destination must be refused, exactly
+// like a symlink doing the same.
+func TestUntarRefusesHardLinkEscape(t *testing.T) {
+	var buf bytes.Buffer
+	gzw := gzip.NewWriter(&buf)
+	tw := tar.NewWriter(gzw)
+	if err := tw.WriteHeader(&tar.Header{
+		Name: "escape", Typeflag: tar.TypeLink, Linkname: "../../etc/passwd",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	tw.Close()
+	gzw.Close()
+
+	opts := DefaultUntarOptions
+	opts.AllowLinks = true
+	if err := UntarWithOptions(t.TempDir(), bytes.NewReader(buf.Bytes()), opts); err == nil {
+		t.Error("a hardlink escaping the destination was accepted")
+	}
+}
