@@ -33,15 +33,94 @@ func QueryPkg(pkgName string, resolveDependencies bool, versionConstrain string)
 	// Without it, a dependency cycle (A -> B -> A) recursed until the stack
 	// overflowed -- which kills the process outright, ignoring any recover --
 	// and a diamond dependency produced exponential duplicate work.
-	visited := make(map[string]struct{})
-	return queryPkg(pkgName, resolveDependencies, versionConstrain, visited, 0)
+	//
+	// It records what each package resolved to, not merely that it was seen.
+	// Skipping on the name alone silently honoured whichever constraint the
+	// walk happened to reach first: with A -> B -> C >= 2.0 and A -> D -> C
+	// >= 3.0, C resolved to 2.x and D's requirement was dropped without a
+	// word, producing an install that cannot work.
+	visited := make(map[string]*resolution)
+	pkg, deps, err := queryPkg(pkgName, resolveDependencies, versionConstrain, visited, 0)
+	if err != nil {
+		return nil, nil, err
+	}
+	return pkg, finalDeps(deps, visited), nil
+}
+
+// finalDeps collapses the traversal's accumulated entries to one per package,
+// taking the version recorded in visited as authoritative and keeping the order
+// in which each package was first reached -- dependencies still precede the
+// packages that need them.
+func finalDeps(deps []map[string]string, visited map[string]*resolution) []map[string]string {
+	if len(deps) == 0 {
+		return deps
+	}
+	seen := make(map[string]struct{}, len(deps))
+	out := make([]map[string]string, 0, len(deps))
+	for _, d := range deps {
+		name := d["name"]
+		if _, dup := seen[name]; dup {
+			continue
+		}
+		seen[name] = struct{}{}
+		if r := visited[name]; r != nil && r.pkg != nil {
+			out = append(out, r.pkg)
+			continue
+		}
+		out = append(out, d)
+	}
+	return out
+}
+
+// resolution is the version chosen for a package and the constraint it was
+// chosen under, so a later requirement can be checked against it.
+type resolution struct {
+	constraint string
+	version    string
+	// pkg is the final answer for this package. The traversal accumulates
+	// entries as it goes, so re-resolving under a tightened constraint would
+	// otherwise leave the superseded entry in the list and the caller would
+	// install the version that was just rejected.
+	pkg map[string]string
+}
+
+// combineConstraints intersects two semver constraints. The library reads a
+// comma-separated list as a conjunction, so "> =2.0, <3.0" means both.
+func combineConstraints(a, b string) string {
+	switch {
+	case a == "":
+		return b
+	case b == "":
+		return a
+	case a == b:
+		return a
+	}
+	return a + ", " + b
+}
+
+// satisfies reports whether an already-chosen version meets a constraint. An
+// unparseable version or constraint counts as not satisfied, so the resolver
+// re-resolves under both rather than assuming the first pick was fine.
+func satisfies(version, constraint string) bool {
+	if constraint == "" {
+		return true
+	}
+	c, err := semver.NewConstraint(constraint)
+	if err != nil {
+		return false
+	}
+	v, err := semver.NewVersion(version)
+	if err != nil {
+		return false
+	}
+	return c.Check(v)
 }
 
 func queryPkg(
 	pkgName string,
 	resolveDependencies bool,
 	versionConstrain string,
-	visited map[string]struct{},
+	visited map[string]*resolution,
 	depth int,
 ) (map[string]string, []map[string]string, error) {
 	log := logger.NewLogger("daemon", "utils.QueryPkg")
@@ -49,7 +128,10 @@ func queryPkg(
 	if depth > maxDependencyDepth {
 		return nil, nil, fmt.Errorf("dependency chain for %q exceeds the maximum depth of %d", pkgName, maxDependencyDepth)
 	}
-	visited[pkgName] = struct{}{}
+	// Provisional: replaced with the chosen version once this package resolves.
+	if visited[pkgName] == nil {
+		visited[pkgName] = &resolution{constraint: versionConstrain}
+	}
 
 	repoMap, err := config.GetAllRepos()
 	if err != nil {
@@ -82,8 +164,41 @@ func queryPkg(
 			log.VerboseInfo("resolving dependencies for " + pkgName)
 			for depName, depVersionConstrain := range deps {
 				// Already reached through another path (or the cycle closed).
-				if _, seen := visited[depName]; seen {
-					log.VerboseInfo("skipping already-resolved dependency " + depName)
+				if seen := visited[depName]; seen != nil {
+					// The version already chosen may not meet this path's
+					// requirement. Skipping on the name alone is what silently
+					// dropped the second constraint in a diamond.
+					if seen.version == "" || satisfies(seen.version, depVersionConstrain) {
+						log.VerboseInfo("skipping already-resolved dependency " + depName)
+						continue
+					}
+
+					combined := combineConstraints(seen.constraint, depVersionConstrain)
+					if combined == seen.constraint {
+						continue // nothing new to ask for; a cycle would loop here
+					}
+					log.VerboseInfo(fmt.Sprintf(
+						"%s resolved to %s under %q but %s requires %q; re-resolving under both",
+						depName, seen.version, seen.constraint, pkgName, depVersionConstrain))
+					previous := seen.constraint
+					seen.constraint = combined
+					depVersionConstrain = combined
+
+					dep, depsOfDep, err := queryPkg(depName, true, combined, visited, depth+1)
+					if err != nil {
+						log.VerboseError(err.Error())
+						return nil, nil, err
+					}
+					// Contradictory requirements. Reporting this is the whole
+					// point: the alternative is installing a version that one
+					// of the two dependants cannot use.
+					if dep == nil || dep["error"] != "" {
+						return nil, nil, fmt.Errorf(
+							"cannot satisfy %s: %s requires %q, but %q is required elsewhere",
+							depName, pkgName, depVersionConstrain, previous)
+					}
+					resolvedDeps = append(resolvedDeps, depsOfDep...)
+					resolvedDeps = append(resolvedDeps, dep)
 					continue
 				}
 
@@ -106,6 +221,14 @@ func queryPkg(
 	if pkg == nil {
 		log.VerboseError("package " + pkgName + " not found in any repo")
 		return queryPkgResponseError(pkgName, "package not found"), nil, nil
+	}
+
+	// Record the version actually chosen so a later path can check its own
+	// constraint against it rather than assuming this one was good enough.
+	if r := visited[pkgName]; r != nil {
+		r.version = pkg["version"]
+		r.constraint = combineConstraints(r.constraint, versionConstrain)
+		r.pkg = pkg
 	}
 
 	return pkg, resolvedDeps, nil

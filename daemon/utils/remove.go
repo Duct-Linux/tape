@@ -116,6 +116,14 @@ func RemovePkg(
 		return nil, err
 	}
 
+	// Removing a library leaves the cache pointing at a file that is gone,
+	// which fails at load time exactly like a missing one.
+	removedPaths := make([]string, 0, len(files))
+	for _, f := range files {
+		removedPaths = append(removedPaths, f.Path)
+	}
+	RefreshLinkerCache(sysroot, removedPaths, log)
+
 	return &RemoveResult{Name: name, FilesRemoved: removed, Orphans: orphans}, nil
 }
 

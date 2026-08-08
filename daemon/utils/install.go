@@ -86,6 +86,14 @@ func InstallPkg(
 	// the staging directory.
 	extractOpts := tarUtils.DefaultUntarOptions
 	extractOpts.AllowLinks = true
+
+	// Setuid is off by default because an arbitrary archive that can set those
+	// bits can hand out root. A package is not an arbitrary archive: its digest
+	// was checked against an index carrying a valid signature from a trusted
+	// key before we got here, so the trust decision has already been made.
+	// Dropping the bits instead would silently ship a broken su, mount or ping
+	// -- the file is present and executable and simply does not work.
+	extractOpts.PreserveSetuid = true
 	if err := tarUtils.UntarWithOptions(staging, archive, extractOpts); err != nil {
 		return nil, fmt.Errorf("extracting %s: %w", filepath.Base(archivePath), err)
 	}
@@ -175,7 +183,7 @@ func InstallPkg(
 		files = append(files, database.InstalledFile{
 			Path:   e.RelPath,
 			Sha256: e.Sha256,
-			Mode:   uint32(e.Mode.Perm()),
+			Mode:   posixMode(e.Mode),
 		})
 	}
 
@@ -200,6 +208,10 @@ func InstallPkg(
 	// The install is committed; the originals are no longer needed. Until this
 	// point every one of them could still be renamed back over its target.
 	tx.cleanup()
+
+	// A newly installed library the linker cannot find is no better than one
+	// that was never installed.
+	RefreshLinkerCache(sysroot, paths, log)
 
 	reportProgress(progress, 100)
 	return &pkg, nil
@@ -306,6 +318,32 @@ func readPkgMetadata(root string) (*PkgMetadata, error) {
 	}
 
 	return meta, nil
+}
+
+// fullMode keeps setuid, setgid and sticky alongside the permission bits.
+//
+// fs.FileMode.Perm() masks to 0777 and discards all three without a word, which
+// is why an installed su lost its setuid bit and /tmp came out 0777 instead of
+// 1777 -- the image build worked around the latter with an explicit chmod.
+func fullMode(m fs.FileMode) fs.FileMode {
+	return m.Perm() | (m & (fs.ModeSetuid | fs.ModeSetgid | fs.ModeSticky))
+}
+
+// posixMode renders a mode the way stat(1) and a tar header do, as 0o7777.
+// fs.FileMode spells the special bits at entirely different bit positions, so
+// storing its raw value would record a number nothing else agrees with.
+func posixMode(m fs.FileMode) uint32 {
+	p := uint32(m.Perm())
+	if m&fs.ModeSetuid != 0 {
+		p |= 0o4000
+	}
+	if m&fs.ModeSetgid != 0 {
+		p |= 0o2000
+	}
+	if m&fs.ModeSticky != 0 {
+		p |= 0o1000
+	}
+	return p
 }
 
 // payloadEntry is one file staged for installation.
@@ -480,6 +518,13 @@ func (tx *installTx) place(entry payloadEntry, target string) error {
 		if err := os.MkdirAll(target, entry.Mode.Perm()); err != nil {
 			return err
 		}
+		// MkdirAll applies the umask, which clears the special bits, so /tmp
+		// would land 0777 rather than 1777. Chmod is not masked.
+		if special := entry.Mode & (fs.ModeSetuid | fs.ModeSetgid | fs.ModeSticky); special != 0 {
+			if err := os.Chmod(target, fullMode(entry.Mode)); err != nil {
+				return err
+			}
+		}
 		tx.dirs = append(tx.dirs, target)
 		return nil
 	}
@@ -528,7 +573,7 @@ func (tx *installTx) place(entry payloadEntry, target string) error {
 	if err := tmp.Sync(); err != nil {
 		return err
 	}
-	if err := tmp.Chmod(entry.Mode.Perm()); err != nil {
+	if err := tmp.Chmod(fullMode(entry.Mode)); err != nil {
 		return err
 	}
 	if err := tmp.Close(); err != nil {
@@ -602,7 +647,7 @@ func (tx *installTx) stash(target string) error {
 	if err := os.Link(target, backupPath); err != nil {
 		// Filesystems without hardlink support (or a target that is not a
 		// regular file) fall back to a copy.
-		if copyErr := copyFileContents(target, backupPath, info.Mode().Perm()); copyErr != nil {
+		if copyErr := copyFileContents(target, backupPath, fullMode(info.Mode())); copyErr != nil {
 			return fmt.Errorf("backing up %s: %w", target, copyErr)
 		}
 	}

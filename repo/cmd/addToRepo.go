@@ -58,12 +58,22 @@ var addToRepoCmd = &cobra.Command{
 		if tx.Error != nil {
 			if !errors.Is(tx.Error, gorm.ErrRecordNotFound) {
 				log.VerboseError(tx.Error.Error())
-				return
+				os.Exit(1)
 			}
 		}
 		if dbPkg.ID != 0 {
+			// Exit non-zero. This reported an error and exited 0, so a script
+			// adding a set of packages could not tell a duplicate from a
+			// success -- the publish pipeline had to re-derive the answer by
+			// querying the index itself. --skip-existing is the opt-in for
+			// callers that genuinely want re-running to be a no-op.
+			skip, _ := cmd.Flags().GetBool("skip-existing")
+			if skip {
+				log.Info("Package already in repository; skipping")
+				return
+			}
 			log.Error("Package already in repository")
-			return
+			os.Exit(1)
 		}
 
 		// Publish the archive first. PkgCopy re-tars the extracted contents
@@ -83,7 +93,7 @@ var addToRepoCmd = &cobra.Command{
 		digest, size, err := utils.PkgDigest(publishedPath)
 		if err != nil {
 			log.Error(err.Error())
-			return
+			os.Exit(1)
 		}
 
 		log.Info("Adding package to repository")
@@ -97,8 +107,11 @@ var addToRepoCmd = &cobra.Command{
 		}
 		tx = repoDb.Create(&dbPkg)
 		if tx.Error != nil {
+			// The archive is already published at this point but nothing
+			// indexes it. Exiting 0 here left the repository in that state and
+			// told the caller it had worked.
 			log.VerboseError(tx.Error.Error())
-			return
+			os.Exit(1)
 		}
 
 		log.Info("Adding package dependencies to repository")
@@ -114,8 +127,10 @@ var addToRepoCmd = &cobra.Command{
 				VersionConstraint: v.(string),
 			})
 			if tx.Error != nil {
+				// A package indexed without its dependencies resolves as though
+				// it had none.
 				log.VerboseError(tx.Error.Error())
-				return
+				os.Exit(1)
 			}
 		}
 
@@ -125,8 +140,10 @@ var addToRepoCmd = &cobra.Command{
 		// Removing it gives clients an accurate "not signed" rather than a
 		// confusing digest mismatch.
 		if err := utils.InvalidateRepoSignature(repoPath); err != nil {
+			// A stale signature over a changed index is worse than no
+			// signature: clients read it as tampering.
 			log.Error(err.Error())
-			return
+			os.Exit(1)
 		}
 		log.Warning("repository index changed: re-run sign-repo before publishing")
 
@@ -141,4 +158,6 @@ var addToRepoCmd = &cobra.Command{
 
 func init() {
 	rootCmd.AddCommand(addToRepoCmd)
+	addToRepoCmd.Flags().Bool("skip-existing", false,
+		"Treat a package that is already indexed as success rather than an error")
 }

@@ -45,8 +45,19 @@ var installCmd = &cobra.Command{
 // connection and closes it before the next one, so nothing leaks even though
 // the daemon serves one request per connection.
 func runInstall(cmd *cobra.Command, args []string) error {
-	if err := refreshBeforeInstall(); err != nil {
-		return fmt.Errorf("refreshing repositories: %w", err)
+	// Refreshing every index before every install is the right default -- it
+	// is how a stale cache stops silently pinning old versions -- but it was
+	// also the only behaviour, so an install could not proceed without network
+	// access to every configured repository. The cache on disk is perfectly
+	// usable for installing something already indexed.
+	noRefresh, err := cmd.Flags().GetBool("no-refresh")
+	if err != nil {
+		return err
+	}
+	if !noRefresh {
+		if err := refreshBeforeInstall(); err != nil {
+			return fmt.Errorf("refreshing repositories: %w", err)
+		}
 	}
 
 	foundPkgs, err := resolvePackages(args)
@@ -236,4 +247,5 @@ func installPackages(paths []string, pkgs []map[string]string, explicit map[stri
 func init() {
 	rootCmd.AddCommand(installCmd)
 	installCmd.Flags().BoolP("yes", "y", false, "Skip confirmation")
+	installCmd.Flags().Bool("no-refresh", false, "Install from the cached repository indexes without refreshing them first")
 }

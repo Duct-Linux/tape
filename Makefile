@@ -22,6 +22,11 @@ env = CGO_ENABLED=0 GOOS=$(GOOS) GOARCH=$(GOARCH) $(if $(GOARM),GOARM=$(GOARM),)
 # -w and -s drop DWARF and the symbol table. -X bakes in the architecture name.
 ldflags = -ldflags '-w -s $(if $(TAPE_ARCH),-X tape/common/arch.buildArch=$(TAPE_ARCH),)'
 
+# Where built binaries land. build-all overrides it per architecture: six cross
+# builds writing to one directory leave only the last one, which looked like a
+# successful multi-arch build and produced a single riscv64 set.
+BIN ?= ./bin
+
 # Installation layout. DESTDIR supports staged installs (packaging, chroots).
 DESTDIR ?=
 PREFIX  ?= /usr
@@ -33,29 +38,29 @@ SYSCONFDIR ?= /etc
 
 build: build-daemon build-cli build-builder build-repo
 
-bin:
-	mkdir -p ./bin
+$(BIN):
+	mkdir -p $(BIN)
 
 # -s -w already strips these binaries; a separate strip(1) pass added nothing
 # and is not available for the target arch when cross-compiling.
-build-daemon: bin
-	$(env) go build $(ldflags) -o ./bin/taped ./daemon/main.go
+build-daemon: $(BIN)
+	$(env) go build $(ldflags) -o $(BIN)/taped ./daemon/main.go
 
-build-cli: bin
-	$(env) go build $(ldflags) -o ./bin/tape ./cli/main.go
+build-cli: $(BIN)
+	$(env) go build $(ldflags) -o $(BIN)/tape ./cli/main.go
 
-build-builder: bin
-	$(env) go build $(ldflags) -o ./bin/tape-builder ./builder/main.go
+build-builder: $(BIN)
+	$(env) go build $(ldflags) -o $(BIN)/tape-builder ./builder/main.go
 
-build-repo: bin
-	$(env) go build $(ldflags) -o ./bin/tape-repo ./repo/main.go
+build-repo: $(BIN)
+	$(env) go build $(ldflags) -o $(BIN)/tape-repo ./repo/main.go
 
 install: build
 	install -d $(DESTDIR)$(BINDIR)
-	install -m 0755 ./bin/taped        $(DESTDIR)$(BINDIR)/taped
-	install -m 0755 ./bin/tape         $(DESTDIR)$(BINDIR)/tape
-	install -m 0755 ./bin/tape-builder $(DESTDIR)$(BINDIR)/tape-builder
-	install -m 0755 ./bin/tape-repo    $(DESTDIR)$(BINDIR)/tape-repo
+	install -m 0755 $(BIN)/taped        $(DESTDIR)$(BINDIR)/taped
+	install -m 0755 $(BIN)/tape         $(DESTDIR)$(BINDIR)/tape
+	install -m 0755 $(BIN)/tape-builder $(DESTDIR)$(BINDIR)/tape-builder
+	install -m 0755 $(BIN)/tape-repo    $(DESTDIR)$(BINDIR)/tape-repo
 	install -d $(DESTDIR)$(SYSCONFDIR)/tape/repos
 	install -d $(DESTDIR)$(SYSCONFDIR)/tape/keys
 	install -d $(DESTDIR)/var/cache/tape/repos
@@ -89,14 +94,17 @@ check: lint vet test
 clean:
 	rm -rf ./bin
 
-# Build for every architecture the distribution targets.
+# Build for every architecture the distribution targets, each into its own
+# directory under ./bin. They all wrote to ./bin itself before, so five of the
+# six were overwritten and the run finished with one riscv64 set of binaries
+# named as though they were the lot.
 build-all:
-	$(MAKE) build GOARCH=amd64                            TAPE_ARCH=x86_64
-	$(MAKE) build GOARCH=arm64                            TAPE_ARCH=aarch64
-	$(MAKE) build GOARCH=arm   GOARM=7                    TAPE_ARCH=armv7h
-	$(MAKE) build GOARCH=arm   GOARM=6                    TAPE_ARCH=armv6h
-	$(MAKE) build GOARCH=386                              TAPE_ARCH=i686
-	$(MAKE) build GOARCH=riscv64                          TAPE_ARCH=riscv64
+	$(MAKE) build GOARCH=amd64            TAPE_ARCH=x86_64  BIN=./bin/x86_64
+	$(MAKE) build GOARCH=arm64            TAPE_ARCH=aarch64 BIN=./bin/aarch64
+	$(MAKE) build GOARCH=arm   GOARM=7    TAPE_ARCH=armv7h  BIN=./bin/armv7h
+	$(MAKE) build GOARCH=arm   GOARM=6    TAPE_ARCH=armv6h  BIN=./bin/armv6h
+	$(MAKE) build GOARCH=386              TAPE_ARCH=i686    BIN=./bin/i686
+	$(MAKE) build GOARCH=riscv64          TAPE_ARCH=riscv64 BIN=./bin/riscv64
 
 go-tidy:
 	@for m in $(MODULES); do \

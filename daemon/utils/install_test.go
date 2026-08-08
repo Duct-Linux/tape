@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"compress/gzip"
 	"errors"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"strings"
@@ -660,5 +661,53 @@ func TestInstallAcceptsEquivalentArchitectureSpelling(t *testing.T) {
 	archive := buildPkgForArch(t, archives, "demo", "1.0", spelling)
 	if _, err := InstallPkg(archive, InstallOptions{Sysroot: sysroot}, db, nil); err != nil {
 		t.Fatalf("InstallPkg refused %q on %s: %v", spelling, arch.Current(), err)
+	}
+}
+
+// A setuid binary that installs without its setuid bit is not a working binary:
+// su, mount and ping are all present, executable, and broken. The bits were
+// dropped twice -- once by extraction policy, once by Perm() at commit -- and
+// the sticky bit on /tmp went the same way, which the image build had to paper
+// over with an explicit chmod.
+func TestInstallPreservesSetuidSetgidAndSticky(t *testing.T) {
+	sysroot, archives, db := testEnv(t)
+
+	archive := buildPkg(t, archives, "privs", "1.0", nil, []pkgFile{
+		{path: "usr/bin/su", body: "#!/bin/sh\n", mode: 0o4755},
+		{path: "usr/bin/wall", body: "#!/bin/sh\n", mode: 0o2755},
+		{path: "tmp", isDir: true, mode: 0o1777},
+	})
+
+	if _, err := InstallPkg(archive, InstallOptions{Sysroot: sysroot}, db, nil); err != nil {
+		t.Fatalf("InstallPkg: %v", err)
+	}
+
+	for _, tc := range []struct {
+		path string
+		want fs.FileMode
+	}{
+		{"usr/bin/su", fs.ModeSetuid},
+		{"usr/bin/wall", fs.ModeSetgid},
+		{"tmp", fs.ModeSticky},
+	} {
+		fi, err := os.Stat(filepath.Join(sysroot, tc.path))
+		if err != nil {
+			t.Fatalf("stat %s: %v", tc.path, err)
+		}
+		if fi.Mode()&tc.want == 0 {
+			t.Errorf("%s: mode %v lost %v", tc.path, fi.Mode(), tc.want)
+		}
+	}
+
+	// The recorded mode must agree with what is on disk, in the encoding the
+	// rest of the world uses for a mode.
+	files, err := db.Files("privs")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, f := range files {
+		if f.Path == "usr/bin/su" && f.Mode != 0o4755 {
+			t.Errorf("recorded mode for su = %#o, want %#o", f.Mode, 0o4755)
+		}
 	}
 }
