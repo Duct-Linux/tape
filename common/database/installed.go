@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"github.com/glebarez/sqlite"
@@ -68,6 +69,18 @@ func (InstalledDep) TableName() string { return "installed_dependencies" }
 // ErrNotInstalled is returned when a package is not present on the system.
 var ErrNotInstalled = errors.New("package is not installed")
 
+// nameMatch is the SQL predicate for a package name.
+//
+// NOCASE, because the two sides of an edge in this database are written by
+// different code paths that disagree about case: an installed package's Name
+// comes from `package.name` in its manifest, which keeps its case, while a
+// dependency edge's Name came from a [dependencies] key, which the old builder
+// lower-cased. So `RequiredBy("libX11")` found none of the edges pointing at it
+// and every mixed-case package read as an orphan -- removable with nothing
+// warning that half the desktop needs it. See utils.FoldName; the collation and
+// that function are ASCII-only and must stay in agreement.
+const nameMatch = "name = ? COLLATE NOCASE"
+
 // FileConflict reports a path claimed by more than one package.
 type FileConflict struct {
 	Path  string
@@ -119,7 +132,7 @@ func (i *InstalledDB) Close() error {
 // Get returns the installed package with the given name.
 func (i *InstalledDB) Get(name string) (*InstalledPkg, error) {
 	var pkg InstalledPkg
-	tx := i.db.Where("name = ?", name).First(&pkg)
+	tx := i.db.Where(nameMatch, name).First(&pkg)
 	if tx.Error != nil {
 		if errors.Is(tx.Error, gorm.ErrRecordNotFound) {
 			return nil, ErrNotInstalled
@@ -208,7 +221,10 @@ func (i *InstalledDB) CheckConflicts(paths []string, excludePkg string) ([]FileC
 			if tx := i.db.Where("id = ?", f.PkgID).First(&owner); tx.Error != nil {
 				return nil, tx.Error
 			}
-			if owner.Name == excludePkg {
+			// EqualFold rather than ==, so this agrees with nameMatch: a
+			// package must not be reported as conflicting with itself under a
+			// different spelling of its own name.
+			if strings.EqualFold(owner.Name, excludePkg) {
 				continue
 			}
 			conflicts = append(conflicts, FileConflict{Path: f.Path, Owner: owner.Name})
@@ -224,7 +240,7 @@ func (i *InstalledDB) Record(pkg InstalledPkg, files []InstalledFile, deps []Ins
 	return i.db.Transaction(func(tx *gorm.DB) error {
 		// Replace wholesale so an upgrade cannot leave stale manifest rows.
 		var existing InstalledPkg
-		found := tx.Where("name = ?", pkg.Name).First(&existing)
+		found := tx.Where(nameMatch, pkg.Name).First(&existing)
 		if found.Error == nil {
 			if err := deletePkgRows(tx, existing.ID); err != nil {
 				return err
@@ -273,7 +289,7 @@ func (i *InstalledDB) Record(pkg InstalledPkg, files []InstalledFile, deps []Ins
 func (i *InstalledDB) Remove(name string) error {
 	return i.db.Transaction(func(tx *gorm.DB) error {
 		var pkg InstalledPkg
-		if err := tx.Where("name = ?", name).First(&pkg).Error; err != nil {
+		if err := tx.Where(nameMatch, name).First(&pkg).Error; err != nil {
 			if errors.Is(err, gorm.ErrRecordNotFound) {
 				return ErrNotInstalled
 			}
@@ -289,7 +305,7 @@ func (i *InstalledDB) Remove(name string) error {
 // RequiredBy returns the installed packages that depend on name.
 func (i *InstalledDB) RequiredBy(name string) ([]string, error) {
 	var deps []InstalledDep
-	if tx := i.db.Where("name = ?", name).Find(&deps); tx.Error != nil {
+	if tx := i.db.Where(nameMatch, name).Find(&deps); tx.Error != nil {
 		return nil, tx.Error
 	}
 

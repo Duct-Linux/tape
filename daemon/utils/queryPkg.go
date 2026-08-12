@@ -17,6 +17,18 @@ import (
 // makes a malformed repository unable to wedge the daemon.
 const maxDependencyDepth = 64
 
+// nameMatch is the SQL predicate for a package name.
+//
+// NOCASE because a published dependency name and the package it names disagree
+// about case: tape-builder wrote [dependencies] keys through viper, which
+// lower-cases them, so every manifest published before that was fixed asks for
+// "libxau" and the row is called "libXau". Without this, `tape install gtk4`
+// stopped at "libxau: package not found" for all sixteen mixed-case packages in
+// the index. See utils.FoldName -- this collation and that function must agree,
+// and both are ASCII-only, which is exactly the character set ValidateName
+// allows.
+const nameMatch = "name = ? COLLATE NOCASE"
+
 /**
  * QueryPkg
  * Query package from all repos
@@ -39,6 +51,12 @@ func QueryPkg(pkgName string, resolveDependencies bool, versionConstrain string)
 	// walk happened to reach first: with A -> B -> C >= 2.0 and A -> D -> C
 	// >= 3.0, C resolved to 2.x and D's requirement was dropped without a
 	// word, producing an install that cannot work.
+	//
+	// Keyed by the FOLDED name, not the name as written. A manifest asks for
+	// "libxau" and the index calls it "libXau"; keyed literally, those are two
+	// entries for one package -- resolved twice, installed twice, and each
+	// blind to the other's version constraint, which is the exact silent-drop
+	// this set exists to prevent.
 	visited := make(map[string]*resolution)
 	pkg, deps, err := queryPkg(pkgName, resolveDependencies, versionConstrain, visited, 0)
 	if err != nil {
@@ -58,7 +76,9 @@ func finalDeps(deps []map[string]string, visited map[string]*resolution) []map[s
 	seen := make(map[string]struct{}, len(deps))
 	out := make([]map[string]string, 0, len(deps))
 	for _, d := range deps {
-		name := d["name"]
+		// Folded, for the same reason visited is: entries reached as "libxau"
+		// and as "libXau" are one package and must collapse to one row.
+		name := utils.FoldName(d["name"])
 		if _, dup := seen[name]; dup {
 			continue
 		}
@@ -128,9 +148,11 @@ func queryPkg(
 	if depth > maxDependencyDepth {
 		return nil, nil, fmt.Errorf("dependency chain for %q exceeds the maximum depth of %d", pkgName, maxDependencyDepth)
 	}
+	pkgKey := utils.FoldName(pkgName)
+
 	// Provisional: replaced with the chosen version once this package resolves.
-	if visited[pkgName] == nil {
-		visited[pkgName] = &resolution{constraint: versionConstrain}
+	if visited[pkgKey] == nil {
+		visited[pkgKey] = &resolution{constraint: versionConstrain}
 	}
 
 	repoMap, err := config.GetAllRepos()
@@ -164,7 +186,7 @@ func queryPkg(
 			log.VerboseInfo("resolving dependencies for " + pkgName)
 			for depName, depVersionConstrain := range deps {
 				// Already reached through another path (or the cycle closed).
-				if seen := visited[depName]; seen != nil {
+				if seen := visited[utils.FoldName(depName)]; seen != nil {
 					// The version already chosen may not meet this path's
 					// requirement. Skipping on the name alone is what silently
 					// dropped the second constraint in a diamond.
@@ -225,7 +247,7 @@ func queryPkg(
 
 	// Record the version actually chosen so a later path can check its own
 	// constraint against it rather than assuming this one was good enough.
-	if r := visited[pkgName]; r != nil {
+	if r := visited[pkgKey]; r != nil {
 		r.version = pkg["version"]
 		r.constraint = combineConstraints(r.constraint, versionConstrain)
 		r.pkg = pkg
@@ -250,7 +272,7 @@ func queryPkgFromRepo(repo *viper.Viper, pkgName string, resolveDependencies boo
 	}
 
 	var pkg []database.RepoModelPkgs
-	tx := repoDb.Find(&pkg, "name = ?", pkgName)
+	tx := repoDb.Find(&pkg, nameMatch, pkgName)
 	if tx.Error != nil {
 		log.VerboseError(tx.Error.Error())
 		return nil, nil, tx.Error
@@ -259,6 +281,21 @@ func queryPkgFromRepo(repo *viper.Viper, pkgName string, resolveDependencies boo
 	if len(pkg) == 0 {
 		log.VerboseInfo("package " + pkgName + " not found in " + repo.GetString("key"))
 		return nil, nil, nil
+	}
+
+	// A case-insensitive match can in principle span two differently-spelled
+	// names, which would silently merge two packages into one identity. It
+	// cannot happen through the mechanism this collation exists for -- a
+	// lower-cased dependency name matching its own mixed-case package -- and it
+	// does not occur in the published index, but an invisible merge is exactly
+	// the failure mode worth naming rather than assuming away.
+	for _, p := range pkg {
+		if p.Name != pkg[0].Name {
+			log.Warning(fmt.Sprintf(
+				"%s matches more than one spelling in %s (%s and %s); treating them as one package",
+				pkgName, repo.GetString("key"), pkg[0].Name, p.Name))
+			break
+		}
 	}
 
 	// Drop builds for other architectures before anything else looks at them.
