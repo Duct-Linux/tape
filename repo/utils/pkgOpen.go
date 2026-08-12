@@ -5,7 +5,6 @@ import (
 	"path"
 	"tape/common/logger"
 	"tape/common/tarUtils"
-	commonUtils "tape/common/utils"
 
 	"github.com/spf13/viper"
 )
@@ -13,9 +12,27 @@ import (
 func PkgOpen(pkgPath string) (string, *viper.Viper, error) {
 	log := logger.NewLogger("repo", "utils.PkgOpen")
 
-	// create a temporary directory
-	tmpDir := path.Join(os.TempDir(), "tape", commonUtils.RandStringRunes(10))
-	err := os.MkdirAll(tmpDir, 0755)
+	// This extraction exists ONLY to read TAPEPACKAGE.toml. Nothing published
+	// comes from it: PkgCopy copies the input bytes, so the tree written here
+	// is read once and thrown away.
+	//
+	// That is why PreserveSetuid stays at its default false below. It is the
+	// right default for the operation this now is -- writing a stranger's
+	// archive into a temporary directory as root -- and no longer costs
+	// anything, because the sanitised tree is not what gets served. Turning it
+	// on here would recreate the privilege-escalation shape without buying
+	// back a single bit.
+	//
+	// os.MkdirTemp rather than a math/rand name under a shared 0755 parent: it
+	// uses crypto-grade randomness and creates the directory exclusively at
+	// 0700, so another user on the publish host cannot pre-create or read it.
+	// The daemon's download path was already fixed this way; this end was not.
+	parent := path.Join(os.TempDir(), "tape")
+	if err := os.MkdirAll(parent, 0755); err != nil {
+		log.VerboseError(err.Error())
+		return "", nil, err
+	}
+	tmpDir, err := os.MkdirTemp(parent, "open-")
 	if err != nil {
 		log.VerboseError(err.Error())
 		return "", nil, err
