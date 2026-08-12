@@ -676,6 +676,12 @@ func TestInstallPreservesSetuidSetgidAndSticky(t *testing.T) {
 		{path: "usr/bin/su", body: "#!/bin/sh\n", mode: 0o4755},
 		{path: "usr/bin/wall", body: "#!/bin/sh\n", mode: 0o2755},
 		{path: "tmp", isDir: true, mode: 0o1777},
+		// The negative arm. Without a file that must come out UNPRIVILEGED,
+		// this test passes just as happily against an install path that sets
+		// setuid on everything it extracts -- a far worse defect than the one
+		// the positive arm guards, and one that would look like success.
+		{path: "usr/bin/plain", body: "#!/bin/sh\n", mode: 0o755},
+		{path: "usr/share/doc", isDir: true, mode: 0o755},
 	})
 
 	if _, err := InstallPkg(archive, InstallOptions{Sysroot: sysroot}, db, nil); err != nil {
@@ -699,6 +705,22 @@ func TestInstallPreservesSetuidSetgidAndSticky(t *testing.T) {
 		}
 	}
 
+	// Installing must not GRANT privilege it was not given. Paired with the
+	// loop above: one arm catches a lost bit, the other an invented one, and
+	// neither is meaningful without the other.
+	for _, path := range []string{"usr/bin/plain", "usr/share/doc"} {
+		fi, err := os.Stat(filepath.Join(sysroot, path))
+		if err != nil {
+			t.Fatalf("stat %s: %v", path, err)
+		}
+		if special := fi.Mode() & (fs.ModeSetuid | fs.ModeSetgid | fs.ModeSticky); special != 0 {
+			t.Errorf("%s: mode %v gained %v; installing must not grant privilege", path, fi.Mode(), special)
+		}
+		if fi.Mode().Perm() != 0o755 {
+			t.Errorf("%s: permissions %04o, want 0755", path, fi.Mode().Perm())
+		}
+	}
+
 	// The recorded mode must agree with what is on disk, in the encoding the
 	// rest of the world uses for a mode.
 	files, err := db.Files("privs")
@@ -708,6 +730,9 @@ func TestInstallPreservesSetuidSetgidAndSticky(t *testing.T) {
 	for _, f := range files {
 		if f.Path == "usr/bin/su" && f.Mode != 0o4755 {
 			t.Errorf("recorded mode for su = %#o, want %#o", f.Mode, 0o4755)
+		}
+		if f.Path == "usr/bin/plain" && f.Mode != 0o755 {
+			t.Errorf("recorded mode for plain = %#o, want %#o", f.Mode, 0o755)
 		}
 	}
 }

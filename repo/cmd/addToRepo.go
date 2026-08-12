@@ -77,12 +77,13 @@ var addToRepoCmd = &cobra.Command{
 			os.Exit(1)
 		}
 
-		// Publish the archive first. PkgCopy re-tars the extracted contents
-		// rather than copying the input file, so the published artifact is a
-		// different sequence of bytes -- digesting the input here would record a
-		// hash that never matches what a client downloads.
+		// Publish the archive first. PkgCopy copies the INPUT BYTES, so the
+		// published artifact is byte-identical to the package handed to
+		// add-to-repo -- which is what the builder produced and what CI
+		// uploaded. It used to re-tar the extraction instead, and that is how
+		// every published package lost its setuid, setgid and sticky bits.
 		log.Info("Copying package to repository")
-		publishedPath, err := utils.PkgCopy(tmpDir, pkgConfig, repoPath)
+		publishedPath, err := utils.PkgCopy(pkgPath, pkgConfig, repoPath)
 		if err != nil {
 			log.Error(err.Error())
 			os.Exit(1)
