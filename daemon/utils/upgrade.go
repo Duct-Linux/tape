@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"tape/common/database"
 	"tape/common/logger"
+	commonUtils "tape/common/utils"
 
 	"github.com/Masterminds/semver/v3"
 )
@@ -40,16 +41,19 @@ func FindUpgrades(names []string, db *database.InstalledDB) ([]UpgradeCandidate,
 		return nil, err
 	}
 
+	// Folded, so `tape upgrade libx11` matches the installed "libX11" -- the
+	// name the user types and the name the manifest recorded need not agree
+	// about case. See commonUtils.FoldName.
 	wanted := make(map[string]struct{}, len(names))
 	for _, n := range names {
-		wanted[n] = struct{}{}
+		wanted[commonUtils.FoldName(n)] = struct{}{}
 	}
 
 	var candidates []UpgradeCandidate
 
 	for _, pkg := range installed {
 		if len(wanted) > 0 {
-			if _, ok := wanted[pkg.Name]; !ok {
+			if _, ok := wanted[commonUtils.FoldName(pkg.Name)]; !ok {
 				continue
 			}
 		}
@@ -93,7 +97,7 @@ func FindUpgrades(names []string, db *database.InstalledDB) ([]UpgradeCandidate,
 	if len(wanted) > 0 {
 		present := make(map[string]struct{}, len(installed))
 		for _, pkg := range installed {
-			present[pkg.Name] = struct{}{}
+			present[commonUtils.FoldName(pkg.Name)] = struct{}{}
 		}
 		for name := range wanted {
 			if _, ok := present[name]; !ok {

@@ -36,8 +36,22 @@ func DownloadPkg(ref structs.PkgRef, progress func(int8)) (string, string, error
 		return "", "", err
 	}
 
+	// Resolve the index row before anything is built from the name. The name in
+	// ref may be spelled the way a manifest asked for it rather than the way
+	// the repository publishes it -- a manifest written by the old builder says
+	// "libxau" for a package the repository calls "libXau" -- and the archive on
+	// the server is named with the repository's spelling. Matching the row
+	// case-insensitively and then formatting the file name from the row is what
+	// makes the two agree; formatting from ref.Name would look up the right row
+	// and then fetch a URL that 404s.
+	canonicalName, expected, expectedSize, err := pkgFromIndex(ref)
+	if err != nil {
+		log.VerboseError(err.Error())
+		return "", "", err
+	}
+
 	baseUrl := repoConfig.GetString("repo.baseurl")
-	pkgFileName := commonUtils.PkgFormatName(ref.Name, ref.Version, ref.Subversion, ref.Arch)
+	pkgFileName := commonUtils.PkgFormatName(canonicalName, ref.Version, ref.Subversion, ref.Arch)
 
 	pkgUrl, err := joinPkgLocation(baseUrl, pkgFileName)
 	if err != nil {
@@ -81,12 +95,8 @@ func DownloadPkg(ref structs.PkgRef, progress func(int8)) (string, string, error
 	// which is why individual archives do not need their own signatures.
 	//
 	// This happens before the path is ever returned, so an unverified archive
-	// is never a candidate for installation.
-	expected, expectedSize, err := pkgDigestFromIndex(ref)
-	if err != nil {
-		os.RemoveAll(tmpDir)
-		return "", "", err
-	}
+	// is never a candidate for installation. The digest came from the same row
+	// the file name did, read once above.
 	if err := VerifyPkgDigest(pkgTmpPath, expected, expectedSize, repoConfig.GetBool("repo.allow-unsigned")); err != nil {
 		log.Error(fmt.Sprintf("refusing %s: %s", ref, err))
 		os.RemoveAll(tmpDir)
@@ -96,24 +106,27 @@ func DownloadPkg(ref structs.PkgRef, progress func(int8)) (string, string, error
 	return pkgTmpPath, commonUtils.ConvertBytesToHumanReadable(size), nil
 }
 
-// pkgDigestFromIndex looks up the digest the repository index records for a
-// package build.
-func pkgDigestFromIndex(ref structs.PkgRef) (string, int64, error) {
+// pkgFromIndex looks up a package build in the repository index and returns the
+// name as the repository spells it, plus the digest and size it records.
+//
+// The name is matched with NOCASE, the same collation the resolver uses: see
+// utils.FoldName for why the two spellings exist at all.
+func pkgFromIndex(ref structs.PkgRef) (string, string, int64, error) {
 	repoDb, err := database.RepoOpenByName(ref.Repo)
 	if err != nil {
-		return "", 0, err
+		return "", "", 0, err
 	}
 
 	var row database.RepoModelPkgs
 	tx := repoDb.Where(
-		"name = ? AND version = ? AND subversion = ? AND arch = ?",
+		"name = ? COLLATE NOCASE AND version = ? AND subversion = ? AND arch = ?",
 		ref.Name, ref.Version, ref.Subversion, ref.Arch,
 	).First(&row)
 	if tx.Error != nil {
-		return "", 0, fmt.Errorf("%s is not listed in the %s index", ref.Name, ref.Repo)
+		return "", "", 0, fmt.Errorf("%s is not listed in the %s index", ref.Name, ref.Repo)
 	}
 
-	return row.Sha256, row.Size, nil
+	return row.Name, row.Sha256, row.Size, nil
 }
 
 // joinPkgLocation builds the package location for either a remote baseurl or a

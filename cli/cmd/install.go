@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"tape/cli/utils"
 	"tape/cli/wrapper"
+	commonUtils "tape/common/utils"
 
 	"github.com/fatih/color"
 	"github.com/rodaine/table"
@@ -95,9 +96,14 @@ func runInstall(cmd *cobra.Command, args []string) error {
 
 	// Packages the user named are explicit; everything the resolver pulled in
 	// is a dependency, and only dependencies can later become orphans.
+	//
+	// Folded on both sides: the resolver answers with the name as the index
+	// spells it, so `tape install libx11` would otherwise come back as "libX11",
+	// miss this set, and be recorded as a dependency -- an orphan the moment it
+	// is installed, which `tape remove --orphans` would then offer to delete.
 	explicit := make(map[string]struct{}, len(args))
 	for _, name := range args {
-		explicit[name] = struct{}{}
+		explicit[commonUtils.FoldName(name)] = struct{}{}
 	}
 
 	return installPackages(paths, foundPkgs, explicit)
@@ -145,7 +151,9 @@ func dedupePkgs(pkgs []map[string]string) []map[string]string {
 	unique := make([]map[string]string, 0, len(pkgs))
 
 	for _, pkg := range pkgs {
-		key := pkg["repo"] + "/" + pkg["name"] + "-" + pkg["version"] + "-" + pkg["subversion"] + "." + pkg["arch"]
+		// The name is folded into the key so two spellings of one package
+		// collapse to a single download and a single install.
+		key := pkg["repo"] + "/" + commonUtils.FoldName(pkg["name"]) + "-" + pkg["version"] + "-" + pkg["subversion"] + "." + pkg["arch"]
 		if _, dup := seen[key]; dup {
 			continue
 		}
@@ -209,7 +217,7 @@ func installPackages(paths []string, pkgs []map[string]string, explicit map[stri
 		if i < len(pkgs) {
 			name, repo = pkgs[i]["name"], pkgs[i]["repo"]
 		}
-		_, isExplicit := explicit[name]
+		_, isExplicit := explicit[commonUtils.FoldName(name)]
 		jobs = append(jobs, job{path: path, name: name, repo: repo, asDependency: !isExplicit})
 	}
 

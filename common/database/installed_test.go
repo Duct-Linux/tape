@@ -277,3 +277,94 @@ func itoa(i int) string {
 	}
 	return string(buf)
 }
+
+// The two sides of a dependency edge are written by code paths that disagree
+// about case: a package's own Name comes from `package.name` in its manifest
+// and keeps its case, while an edge's Name came from a [dependencies] key,
+// which the old builder lower-cased. Every mixed-case package therefore looked
+// like nothing depended on it.
+func TestRequiredByMatchesRegardlessOfCase(t *testing.T) {
+	db := openTestDB(t)
+	record(t, db, "libX11", ReasonDependency, []string{"usr/lib/libX11.so"})
+	// cairo's manifest asks for "libx11": what the old builder published.
+	record(t, db, "cairo", ReasonExplicit, []string{"usr/lib/libcairo.so"}, "libx11")
+
+	dependents, err := db.RequiredBy("libX11")
+	if err != nil {
+		t.Fatalf("RequiredBy: %v", err)
+	}
+	if len(dependents) != 1 || dependents[0] != "cairo" {
+		t.Fatalf("RequiredBy(libX11) = %v, want [cairo] -- the lower-cased edge cairo "+
+			"actually published was not matched", dependents)
+	}
+}
+
+// The consequence of the above, and the dangerous one: a package half the
+// desktop links against offered for deletion as an orphan.
+func TestMixedCasePackageIsNotAnOrphan(t *testing.T) {
+	db := openTestDB(t)
+	record(t, db, "libX11", ReasonDependency, []string{"usr/lib/libX11.so"})
+	record(t, db, "cairo", ReasonExplicit, []string{"usr/lib/libcairo.so"}, "libx11")
+
+	orphans, err := db.Orphans()
+	if err != nil {
+		t.Fatalf("Orphans: %v", err)
+	}
+	for _, o := range orphans {
+		if o == "libX11" {
+			t.Fatalf("libX11 reported as an orphan while cairo depends on it (orphans: %v)", orphans)
+		}
+	}
+}
+
+// Control: Orphans must still find a real one. Case-insensitive matching that
+// made every package look required would pass the test above and silently
+// disable orphan detection altogether.
+func TestControlOrphansStillFindsARealOrphan(t *testing.T) {
+	db := openTestDB(t)
+	record(t, db, "libX11", ReasonDependency, []string{"usr/lib/libX11.so"})
+	record(t, db, "libXau", ReasonDependency, []string{"usr/lib/libXau.so"})
+	record(t, db, "cairo", ReasonExplicit, []string{"usr/lib/libcairo.so"}, "libx11")
+
+	orphans, err := db.Orphans()
+	if err != nil {
+		t.Fatalf("Orphans: %v", err)
+	}
+	if len(orphans) != 1 || orphans[0] != "libXau" {
+		t.Fatalf("Orphans() = %v, want [libXau] -- nothing depends on libXau", orphans)
+	}
+}
+
+// Get and Remove take a name a user typed, which need not match the case the
+// manifest recorded.
+func TestGetAndRemoveAreCaseInsensitive(t *testing.T) {
+	db := openTestDB(t)
+	record(t, db, "libXau", ReasonExplicit, []string{"usr/lib/libXau.so"})
+
+	pkg, err := db.Get("libxau")
+	if err != nil {
+		t.Fatalf("Get(libxau): %v", err)
+	}
+	// The record keeps its own spelling; only the lookup folds.
+	if pkg.Name != "libXau" {
+		t.Errorf("Get(libxau).Name = %q, want libXau", pkg.Name)
+	}
+
+	if err := db.Remove("LIBXAU"); err != nil {
+		t.Fatalf("Remove(LIBXAU): %v", err)
+	}
+	if _, err := db.Get("libXau"); !errors.Is(err, ErrNotInstalled) {
+		t.Fatalf("after Remove, Get returned %v, want ErrNotInstalled", err)
+	}
+}
+
+// Control: a package that is genuinely absent must still be absent. A fold
+// broad enough to match anything would satisfy every test above.
+func TestControlAbsentPackageStillNotInstalled(t *testing.T) {
+	db := openTestDB(t)
+	record(t, db, "libXau", ReasonExplicit, []string{"usr/lib/libXau.so"})
+
+	if _, err := db.Get("libXauXX"); !errors.Is(err, ErrNotInstalled) {
+		t.Fatalf("Get(libXauXX) returned %v, want ErrNotInstalled", err)
+	}
+}
