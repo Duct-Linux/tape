@@ -13,6 +13,7 @@ import (
 	"tape/common/arch"
 	"tape/common/database"
 	"tape/common/logger"
+	"tape/common/manifest"
 	"tape/common/structs"
 	"tape/common/tarUtils"
 	commonUtils "tape/common/utils"
@@ -302,15 +303,17 @@ func readPkgMetadata(root string) (*PkgMetadata, error) {
 		return nil, fmt.Errorf("package metadata: %w", err)
 	}
 
-	for name, raw := range cfg.GetStringMap("dependencies") {
-		// builder writes a nil "build" key rather than deleting it.
-		if name == "build" || raw == nil {
-			continue
-		}
-		constraint, ok := raw.(string)
-		if !ok {
-			continue
-		}
+	// Not cfg.GetStringMap: viper lower-cases every key it returns, and a
+	// [dependencies] key is a package name. Reading them through viper is what
+	// recorded "libx11" as the dependency edge of a package called libX11, so
+	// RequiredBy matched nothing and every mixed-case package read as an
+	// orphan. Lookups fold (see commonUtils.FoldName), but an edge should
+	// record what the manifest actually says. See tape/common/manifest.
+	deps, err := manifest.ReadDependencies(filepath.Join(root, "TAPEPACKAGE.toml"))
+	if err != nil {
+		return nil, err
+	}
+	for name, constraint := range deps.Runtime {
 		if err := commonUtils.ValidateName(name); err != nil {
 			return nil, fmt.Errorf("dependency name %q: %w", name, err)
 		}

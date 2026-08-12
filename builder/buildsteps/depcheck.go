@@ -10,6 +10,7 @@ import (
 	"tape/common/database"
 	"tape/common/global"
 	"tape/common/logger"
+	commonUtils "tape/common/utils"
 )
 
 // checkDeclaredDeps compares the shared libraries a package's binaries actually
@@ -26,7 +27,7 @@ import (
 // an installed database to resolve sonames against -- a from-scratch bootstrap
 // in duct/chroot is not -- and a check that cannot see ownership must not
 // invent a failure. What it can always do is name what is missing.
-func checkDeclaredDeps(payload string, declared map[string]any, log *logger.Logger) {
+func checkDeclaredDeps(payload string, declared map[string]string, log *logger.Logger) {
 	needed, provided := scanELF(payload)
 	if len(needed) == 0 {
 		return
@@ -58,11 +59,13 @@ func checkDeclaredDeps(payload string, declared map[string]any, log *logger.Logg
 	}
 	defer db.Close()
 
+	// Folded, because the owner comes from the installed database (which spells
+	// a package the way its own manifest does) and the declaration comes from
+	// the recipe author. A recipe writing "libx11" for libX11 is asking for the
+	// right package and must not be reported as having declared nothing.
 	declaredSet := make(map[string]struct{}, len(declared))
 	for name := range declared {
-		if name != "build" {
-			declaredSet[name] = struct{}{}
-		}
+		declaredSet[commonUtils.FoldName(name)] = struct{}{}
 	}
 
 	missing := make(map[string][]string)
@@ -78,7 +81,7 @@ func checkDeclaredDeps(payload string, declared map[string]any, log *logger.Logg
 		if err != nil || owner == "" {
 			continue // not owned by any package: part of the image, not a dependency
 		}
-		if _, ok := declaredSet[owner]; !ok {
+		if _, ok := declaredSet[commonUtils.FoldName(owner)]; !ok {
 			missing[owner] = append(missing[owner], soname)
 		}
 	}

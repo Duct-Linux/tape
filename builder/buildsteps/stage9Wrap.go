@@ -4,10 +4,10 @@ import (
 	"path"
 	"tape/builder/utils"
 	"tape/common/logger"
+	"tape/common/manifest"
 	commonUtils "tape/common/utils"
 
 	cp "github.com/otiai10/copy"
-	"github.com/spf13/viper"
 )
 
 func Stage9Wrap() error {
@@ -34,31 +34,45 @@ func Stage9Wrap() error {
 		pkgArch = targetArch
 	)
 
-	// build TAPEPACKAGE.toml
-	wrapConfig := viper.New()
-
-	wrapConfig.SetConfigFile(path.Join(utils.DirWrap(pkgPath), "TAPEPACKAGE.toml"))
-
-	wrapConfig.Set("package.name", pkgName)
-	wrapConfig.Set("package.description", pkgDesc)
-	wrapConfig.Set("package.version", pkgVer)
-	wrapConfig.Set("package.subversion", pkgSubVer)
-	wrapConfig.Set("package.authors", buildConfig.GetStringSlice("package.authors"))
-	wrapConfig.Set("package.packagers", buildConfig.GetStringSlice("package.packagers"))
-	wrapConfig.Set("package.arch", pkgArch)
-
-	deps := buildConfig.GetStringMap("dependencies")
+	// The dependency table is read from the recipe file directly rather than
+	// through buildConfig, because a [dependencies] key is a package NAME and
+	// viper lower-cases every key it returns: "libXau = ..." came back as
+	// "libxau", and that is what got written into the manifest and published.
+	// package.name above is a VALUE, which is why it was never affected and why
+	// the index ended up holding a package called libXau that nothing could ask
+	// for by name. See tape/common/manifest.
+	//
+	// The resolver's case-insensitive matching is what keeps every manifest
+	// published before this fix installable; this only stops new ones being
+	// written wrong. Do not tighten one without the other.
+	deps, err := manifest.ReadDependencies(utils.PkgBuildConfigPath(pkgPath))
+	if err != nil {
+		log.VerboseError(err.Error())
+		return err
+	}
 
 	// What the payload actually links against, against what the recipe claims.
 	// A package can otherwise install cleanly and fail to run.
-	checkDeclaredDeps(utils.DirWrapInstall(pkgPath), deps, log)
+	checkDeclaredDeps(utils.DirWrapInstall(pkgPath), deps.Runtime, log)
 
-	// filter out build dependencies
-	deps["build"] = nil
-	wrapConfig.Set("dependencies", deps)
-
-	err = wrapConfig.WriteConfig()
-	if err != nil {
+	// Build dependencies are not carried into the package: deps.Build is simply
+	// not written. The old builder set the key to nil instead, which viper
+	// omitted from the file, so the result on disk is the same.
+	if err := manifest.WritePackage(
+		path.Join(utils.DirWrap(pkgPath), "TAPEPACKAGE.toml"),
+		manifest.PackageManifest{
+			Package: manifest.Package{
+				Name:        pkgName,
+				Description: pkgDesc,
+				Version:     pkgVer,
+				Subversion:  pkgSubVer,
+				Authors:     buildConfig.GetStringSlice("package.authors"),
+				Packagers:   buildConfig.GetStringSlice("package.packagers"),
+				Arch:        pkgArch,
+			},
+			Dependencies: deps.Runtime,
+		},
+	); err != nil {
 		log.VerboseError(err.Error())
 		return err
 	}

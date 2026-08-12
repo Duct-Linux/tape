@@ -8,6 +8,7 @@ import (
 	"os"
 	"path"
 	"tape/common/database"
+	"tape/common/manifest"
 	commonUtils "tape/common/utils"
 	"tape/repo/utils"
 
@@ -115,16 +116,22 @@ var addToRepoCmd = &cobra.Command{
 		}
 
 		log.Info("Adding package dependencies to repository")
-		dep := pkgConfig.GetStringMap("dependencies")
-		for k, v := range dep {
-			if k == "build" {
-				continue
-			}
-
+		// Read from the manifest file rather than through pkgConfig: viper
+		// lower-cases every key it returns, and a [dependencies] key is a
+		// package name. This is the second half of the same defect the builder
+		// has -- fixing only the builder would change nothing, because the
+		// correctly-cased names it now writes would be lower-cased again on
+		// their way into the index, right here. See tape/common/manifest.
+		deps, err := manifest.ReadDependencies(path.Join(tmpDir, "TAPEPACKAGE.toml"))
+		if err != nil {
+			log.Error(err.Error())
+			os.Exit(1)
+		}
+		for k, v := range deps.Runtime {
 			tx = repoDb.Create(&database.RepoModelDependencies{
 				PkgId:             dbPkg.ID,
 				Name:              k,
-				VersionConstraint: v.(string),
+				VersionConstraint: v,
 			})
 			if tx.Error != nil {
 				// A package indexed without its dependencies resolves as though
